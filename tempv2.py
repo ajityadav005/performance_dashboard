@@ -284,320 +284,21 @@ PLOTLY_LAYOUT = dict(
 # CALCULATION ENGINE
 # ─────────────────────────────────────────────
 
-
-# ─────────────────────────────────────────────
-# FREQUENCY DETECTION
-# ─────────────────────────────────────────────
-
 def detect_frequency(dates: pd.DatetimeIndex) -> str:
     """
-    Robust frequency detection using median date gap.
+    Infer data frequency from the average gap between consecutive dates.
+    Returns 'daily' when the average gap is ≤ 6 days, else 'monthly'.
+    Logs the detected frequency for traceability.
     """
-
     if len(dates) < 2:
-        log.warning("detect_frequency: fewer than 2 dates — defaulting to monthly")
+        # Cannot determine frequency from a single point; default to monthly
+        log.warning("detect_frequency: fewer than 2 dates — defaulting to 'monthly'")
         return 'monthly'
 
-    gaps = pd.Series(dates).diff().dt.days.dropna()
-
-    median_gap = gaps.median()
-
-    if median_gap <= 7:
-        freq = 'daily'
-    else:
-        freq = 'monthly'
-
-    log.info(
-        "detect_frequency: median_gap=%.2f days → frequency='%s'",
-        median_gap,
-        freq
-    )
-
+    avg_days = (dates[-1] - dates[0]).days / len(dates)
+    freq = 'daily' if avg_days <= 6 else 'monthly'
+    log.info("detect_frequency: avg_days=%.1f → frequency='%s'", avg_days, freq)
     return freq
-
-
-# ─────────────────────────────────────────────
-# METRIC ENGINE
-# ─────────────────────────────────────────────
-
-def compute_metrics(nav: pd.Series, ann_factor: int) -> dict:
-
-    log.debug(
-        "compute_metrics: series='%s' len=%d ann_factor=%d",
-        nav.name,
-        len(nav),
-        ann_factor
-    )
-
-    nav = nav.dropna()
-
-    if len(nav) < 2:
-        log.warning("compute_metrics: insufficient NAV observations")
-        return {}
-
-    if nav.iloc[0] <= 0:
-        log.warning("compute_metrics: non-positive starting NAV")
-        return {}
-
-    ret = nav.pct_change().dropna()
-
-    if len(ret) < 2:
-        log.warning("compute_metrics: insufficient return observations")
-        return {}
-
-    # ─────────────────────────────────────────
-    # ACTUAL ELAPSED YEARS
-    # ─────────────────────────────────────────
-
-    days = (nav.index[-1] - nav.index[0]).days
-
-    if days <= 0:
-        log.warning("compute_metrics: invalid date range")
-        return {}
-
-    years = days / 365.25
-
-    # ─────────────────────────────────────────
-    # CAGR
-    # ─────────────────────────────────────────
-
-    cagr = (nav.iloc[-1] / nav.iloc[0]) ** (1 / years) - 1
-
-    # ─────────────────────────────────────────
-    # VOLATILITY
-    # ─────────────────────────────────────────
-
-    ann_std = ret.std(ddof=1) * np.sqrt(ann_factor)
-
-
-    # ─────────────────────────────────────────
-    # SHARPE
-    # ─────────────────────────────────────────
-
-    sharpe = cagr / ann_std if ann_std > 0 else np.nan
-
-    # ─────────────────────────────────────────
-    # DRAWDOWN
-    # ─────────────────────────────────────────
-
-    rolling_max = nav.cummax()
-
-    drawdown = (nav - rolling_max) / rolling_max
-
-    max_dd = drawdown.min()
-
-    max_dd_date = drawdown.idxmin()
-
-    # ─────────────────────────────────────────
-    # SORTINO
-    # ─────────────────────────────────────────
-
-    target = 0
-
-    downside = np.minimum(ret - target, 0)
-
-    downside_std = np.sqrt(np.mean(downside**2)) * np.sqrt(ann_factor)
-
-    sortino = cagr / downside_std if downside_std > 0 else np.nan
-
-    # ─────────────────────────────────────────
-    # CALMAR
-    # ─────────────────────────────────────────
-
-    calmar = cagr / abs(max_dd) if max_dd != 0 else np.nan
-
-    # ─────────────────────────────────────────
-    # CV
-    # ─────────────────────────────────────────
-
-    cv = ann_std / abs(cagr) if abs(cagr) > 1e-6 else np.nan
-
-    metrics = {
-        'start_date': nav.index[0],
-        'end_date': nav.index[-1],
-        'years': years,
-        'cagr': cagr,
-        'ann_std': ann_std,
-        #'ann_ret': ann_ret,
-        'cv': cv,
-        'sharpe': sharpe,
-        'max_dd': max_dd,
-        'max_dd_date': max_dd_date,
-        'sortino': sortino,
-        'calmar': calmar,
-        'n_obs': len(ret),
-    }
-
-    log.info(
-        "compute_metrics complete: '%s' CAGR=%.2f%% Sharpe=%.2f MaxDD=%.2f%%",
-        nav.name,
-        cagr * 100,
-        sharpe,
-        max_dd * 100
-    )
-
-    return metrics
-
-
-# ─────────────────────────────────────────────
-# ROLLING METRIC ENGINE
-# ─────────────────────────────────────────────
-
-def rolling_metric(
-    nav: pd.Series,
-    window_months: int,
-    metric: str,
-    ann_factor: int
-) -> pd.Series:
-
-    log.debug(
-        "rolling_metric: metric='%s' window=%d series='%s'",
-        metric,
-        window_months,
-        nav.name
-    )
-
-    # --------------------------------------------------
-    # VALIDATE NAV SERIES
-    # --------------------------------------------------
-
-    first_valid = nav.first_valid_index()
-    last_valid = nav.last_valid_index()
-
-    if first_valid is None:
-        raise ValueError(
-            f"Series '{nav.name}' contains no valid NAV values."
-        )
-
-    nav_core = nav.loc[first_valid:last_valid]
-
-    if nav_core.isna().any():
-
-        missing_dates = nav_core[nav_core.isna()].index
-
-        raise ValueError(
-            f"Series '{nav.name}' contains "
-            f"{len(missing_dates)} missing NAV value(s) "
-            f"between {first_valid.date()} and {last_valid.date()}.\n"
-            f"First missing date: {missing_dates[0].date()}"
-        )
-
-    # --------------------------------------------------
-    # MONTHLY CONVERSION
-    # --------------------------------------------------
-
-    monthly = (
-        to_monthly_nav(nav_core)
-        if ann_factor == 252
-        else nav_core.copy()
-    )
-
-    monthly = monthly.dropna()
-
-    if len(monthly) < window_months:
-
-        log.warning(
-            "rolling_metric: insufficient data "
-            "for window=%d series='%s'",
-            window_months,
-            nav.name
-        )
-
-        return pd.Series(dtype=float)
-
-    results = {}
-
-    # --------------------------------------------------
-    # ROLLING CALCULATION
-    # --------------------------------------------------
-
-    for i in range(window_months - 1, len(monthly)):
-
-        window_nav = monthly.iloc[
-            i - window_months + 1 : i + 1
-        ]
-
-        start_val = window_nav.iloc[0]
-        end_val = window_nav.iloc[-1]
-
-        if start_val <= 0:
-            continue
-
-        returns = window_nav.pct_change().dropna()
-
-        if len(returns) < 2:
-            continue
-
-        years = (
-            window_nav.index[-1]
-            - window_nav.index[0]
-        ).days / 365.25
-
-        if years <= 0:
-            continue
-
-        cagr = (
-            (end_val / start_val) ** (1 / years)
-        ) - 1
-
-        ann_std = (
-            returns.std(ddof=1)
-            * np.sqrt(12)
-        )
-
-        if metric == "std":
-
-            val = ann_std * 100
-
-        elif metric == "sharpe":
-
-            val = (
-                cagr / ann_std
-                if ann_std > 0
-                else np.nan
-            )
-
-        elif metric == "cagr":
-
-            val = cagr * 100
-
-        else:
-
-            raise ValueError(
-                f"Unknown metric: {metric}"
-            )
-
-        results[window_nav.index[-1]] = val
-
-    log.info(
-        "rolling_metric complete: "
-        "metric='%s' window=%d points=%d",
-        metric,
-        window_months,
-        len(results)
-    )
-
-    return pd.Series(results)
-
-
-# ─────────────────────────────────────────────
-# DISTRIBUTION STABILITY FIX
-# ─────────────────────────────────────────────
-
-def get_monthly_returns(nav_series: pd.Series) -> pd.Series:
-
-    monthly = (
-        nav_series.resample('ME').last().dropna()
-        if ann_factor == 252
-        else nav_series.dropna()
-    )
-
-    returns = monthly.pct_change().dropna() * 100
-
-    return returns
-
-
-
 
 
 def compute_returns(nav: pd.Series) -> pd.Series:
@@ -618,6 +319,184 @@ def to_monthly_nav(nav: pd.Series) -> pd.Series:
     monthly = nav.resample('ME').last().dropna()
     log.debug("to_monthly_nav: daily_len=%d → monthly_len=%d", len(nav), len(monthly))
     return monthly
+
+
+def compute_metrics(nav: pd.Series, ann_factor: int) -> dict:
+    """
+    Compute a full suite of annualised risk/return metrics for one NAV series.
+
+    Parameters
+    ----------
+    nav        : NAV price series (DatetimeIndex).
+    ann_factor : 252 for daily data, 12 for monthly data.
+
+    Returns
+    -------
+    dict of metrics, or empty dict when there is insufficient data.
+
+    Metrics computed
+    ────────────────
+    • CAGR            — Compound Annual Growth Rate
+    • ann_std         — Annualised standard deviation of period returns
+    • cv              — Coefficient of Variation (ann_std / |CAGR|)
+    • sharpe          — Sharpe Ratio assuming RF = 0 %
+    • max_dd          — Maximum peak-to-trough drawdown (as a fraction)
+    • max_dd_date     — Date the maximum drawdown was reached
+    • sortino         — Sortino Ratio (downside deviation denominator)
+    • calmar          — Calmar Ratio (CAGR / |max drawdown|)
+    """
+    log.debug("compute_metrics: series='%s' len=%d ann_factor=%d",
+              nav.name, len(nav), ann_factor)
+
+    nav = nav.dropna()
+    if len(nav) < 2:
+        log.warning("compute_metrics: series too short (len=%d) — returning empty dict", len(nav))
+        return {}
+
+    ret = nav.pct_change().dropna()
+    if len(ret) < 2:
+        log.warning("compute_metrics: fewer than 2 return observations — returning empty dict")
+        return {}
+
+    n = len(ret)
+    years = n / ann_factor
+
+    # ── CAGR ─────────────────────────────────────────────────────────
+    cagr = (nav.iloc[-1] / nav.iloc[0]) ** (1 / years) - 1
+    log.debug("compute_metrics: CAGR=%.4f years=%.2f", cagr, years)
+
+    # ── Volatility ───────────────────────────────────────────────────
+    ann_std = ret.std() * np.sqrt(ann_factor)
+
+    # ── Coefficient of Variation ──────────────────────────────────────
+    cv = ann_std / abs(cagr) if cagr != 0 else np.nan
+
+    # ── Sharpe Ratio (RF = 0 %) ───────────────────────────────────────
+    sharpe = cagr / ann_std if ann_std != 0 else np.nan
+
+    # ── Maximum Drawdown ──────────────────────────────────────────────
+    rolling_max = nav.cummax()
+    drawdown = (nav - rolling_max) / rolling_max
+    max_dd = drawdown.min()
+    max_dd_date = drawdown.idxmin()
+    log.debug("compute_metrics: max_dd=%.4f at %s", max_dd, max_dd_date)
+
+    # ── Sortino Ratio ─────────────────────────────────────────────────
+    neg_ret = ret[ret < 0]
+    if len(neg_ret) > 1:
+        downside_std = np.sqrt((neg_ret ** 2).mean()) * np.sqrt(ann_factor)
+        sortino = cagr / downside_std if downside_std != 0 else np.nan
+    else:
+        # Fewer than 2 negative return periods — Sortino is undefined
+        log.warning("compute_metrics: insufficient negative returns for Sortino (n_neg=%d)", len(neg_ret))
+        sortino = np.nan
+
+    # ── Calmar Ratio ──────────────────────────────────────────────────
+    calmar = cagr / abs(max_dd) if max_dd != 0 else np.nan
+
+    metrics = {
+        'start_date': nav.index[0],
+        'end_date': nav.index[-1],
+        'years': years,
+        'cagr': cagr,
+        'ann_std': ann_std,
+        'cv': cv,
+        'sharpe': sharpe,
+        'max_dd': max_dd,
+        'max_dd_date': max_dd_date,
+        'sortino': sortino,
+        'calmar': calmar,
+        'n_obs': n,
+    }
+    log.info("compute_metrics: completed for series '%s' — CAGR=%.2f%% Sharpe=%.2f MaxDD=%.2f%%",
+             nav.name, cagr * 100, sharpe if sharpe is not np.nan else float('nan'), max_dd * 100)
+    return metrics
+
+
+def rolling_metric(nav: pd.Series, window_months: int, metric: str, ann_factor: int) -> pd.Series:
+    """
+    Compute a rolling metric over a sliding window on monthly NAV data.
+
+    Parameters
+    ----------
+    nav           : Raw NAV series (daily or monthly).
+    window_months : Width of the sliding window in calendar months.
+    metric        : One of 'std', 'sharpe', 'cagr'.
+    ann_factor    : 252 for daily input, 12 for monthly input.
+
+    Returns
+    -------
+    pd.Series indexed by the window end-date, or an empty Series when
+    there is not enough data.
+
+    Implementation notes
+    ────────────────────
+    • Daily NAVs are first resampled to month-end so the window is always
+      measured in months regardless of the raw frequency.
+    • Each window is a pure slice of monthly observations — no overlapping
+      daily windows — which keeps observations independent.
+    • std   : annualised std dev of monthly returns (× √12) in percent.
+    • sharpe: CAGR / annualised std dev (RF = 0 %).
+    • cagr  : compound annual growth rate of the window in percent.
+    """
+    log.debug("rolling_metric: metric='%s' window=%d months series='%s'",
+              metric, window_months, nav.name)
+
+    # Resample to monthly if the source is daily
+    monthly = to_monthly_nav(nav) if ann_factor == 252 else nav.copy()
+    monthly = monthly.dropna()
+    n = len(monthly)
+
+    if n < window_months:
+        # Not enough monthly observations to fill even one window
+        log.warning("rolling_metric: only %d monthly obs for window=%d — returning empty",
+                    n, window_months)
+        return pd.Series(dtype=float)
+
+    nav_arr = monthly.values
+    idx = monthly.index
+    results = {}
+
+    for i in range(window_months - 1, n):
+        slice_nav = nav_arr[i - window_months + 1: i + 1]
+
+        # Skip any window that contains NaN values
+        if np.any(np.isnan(slice_nav)):
+            log.debug("rolling_metric: NaN in window ending %s — skipped", idx[i])
+            continue
+
+        start_val, end_val = slice_nav[0], slice_nav[-1]
+        if start_val <= 0:
+            # Guard against zero or negative starting NAV (would give nonsensical CAGR)
+            log.warning("rolling_metric: non-positive start_val=%.4f at %s — skipped",
+                        start_val, idx[i])
+            continue
+
+        ret = np.diff(slice_nav) / slice_nav[:-1]
+        if len(ret) < 2:
+            continue
+
+        if metric == 'std':
+            # Annualised standard deviation of monthly returns (returned as %)
+            val = float(np.std(ret, ddof=1) * np.sqrt(12) * 100)
+        elif metric == 'sharpe':
+            # CAGR over the window divided by annualised std dev (RF = 0 %)
+            ann_ret = (end_val / start_val) ** (12 / window_months) - 1
+            ann_std = float(np.std(ret, ddof=1) * np.sqrt(12))
+            val = ann_ret / ann_std if ann_std > 0 else np.nan
+        elif metric == 'cagr':
+            # Annualised compound return over the window (returned as %)
+            val = float(((end_val / start_val) ** (12 / window_months) - 1) * 100)
+        else:
+            log.error("rolling_metric: unknown metric '%s'", metric)
+            val = np.nan
+
+        results[idx[i]] = val
+
+    log.info("rolling_metric: metric='%s' window=%d → %d data-points computed",
+             metric, window_months, len(results))
+    return pd.Series(results)
+
 
 # ─────────────────────────────────────────────
 # CHART HELPERS
@@ -1434,8 +1313,6 @@ with tab_yearly:
                 )
         return styles
 
-    yearly_df.index.name = 'Year'
-    yearly_df.index = yearly_df.index.astype(str)
     styled_yearly = (
         yearly_df
         .style
@@ -1462,6 +1339,20 @@ with tab_dist:
 
     from scipy.stats import norm as sp_norm
 
+    def get_monthly_returns(nav_series: pd.Series) -> pd.Series:
+        """
+        Return independent month-end percentage returns.
+
+        For daily input: resample to month-end then pct_change.
+        For monthly input: pct_change directly.
+        Using month-end sampling ensures each observation covers a distinct
+        calendar month, so there is no overlap between windows.
+        Returns values as percentages (multiplied by 100).
+        """
+        monthly = nav_series.resample('ME').last().dropna() if ann_factor == 252 else nav_series.dropna()
+        returns = monthly.pct_change().dropna() * 100
+        log.debug("get_monthly_returns: '%s' → %d monthly return observations", nav_series.name, len(returns))
+        return returns
 
     ncols = 2
     nrows = (len(portfolios) + ncols - 1) // ncols
