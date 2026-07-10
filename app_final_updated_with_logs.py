@@ -1085,7 +1085,88 @@ with tab_dd:
     st.plotly_chart(fig, width='stretch')
 
     # ── Max Drawdown Summary Table ────────────────────────────────────
-  
+    st.markdown("**Max Drawdown Summary**")
+    dd_rows = []
+    for p in portfolios:
+        nav = df[p].dropna()
+        nav = nav[nav > 0]
+        rolling_max = nav.cummax()
+        dd = ((nav - rolling_max) / rolling_max).clip(upper=0)
+        max_dd = dd.min()
+        max_dd_date = dd.idxmin()
+
+        peak_before = rolling_max.loc[max_dd_date]
+        after = nav.loc[max_dd_date:]
+        recovered = after[after >= peak_before]
+        recovery = recovered.index[0].strftime('%b %Y') if len(recovered) > 0 else 'Not recovered'
+
+        log.debug("Drawdown summary '%s': max_dd=%.2f%% recovery='%s'", p, max_dd * 100, recovery)
+        dd_rows.append({
+            'Portfolio': p,
+            'Max Drawdown': f"{max_dd*100:.2f}%",
+            'Date of Max DD': max_dd_date.strftime('%d %b %Y'),
+            'Recovery Date': recovery,
+        })
+
+    st.dataframe(pd.DataFrame(dd_rows).set_index('Portfolio'), width='stretch')
+
+    st.markdown("---")
+
+    # ── Top-5 Drawdown Episodes Helper ────────────────────────────────
+    def get_top_drawdowns(nav: pd.Series, n: int = 5) -> list:
+        """
+        Identify peak-to-trough drawdown episodes (not just point-in-time
+        values) and return the n deepest ones, each with peak date,
+        trough date, magnitude, and recovery date.
+
+        An "episode" starts at a new all-time-high (drawdown == 0) and
+        runs until the next new all-time-high. The single worst point
+        within each episode is its trough.
+        """
+        nav = nav.dropna()
+        nav = nav[nav > 0]
+
+        if len(nav) < 2:
+            return []
+
+        roll_max = nav.cummax()
+        dd = (nav - roll_max) / roll_max  # <= 0, 0 at new highs
+
+        is_peak = dd == 0
+        group_id = is_peak.cumsum()
+
+        episodes = []
+        for _, grp in dd.groupby(group_id):
+            if not (grp < 0).any():
+                continue  # flat/only-peak group, no actual decline
+
+            trough_date = grp.idxmin()
+            trough_val = grp.min()
+            peak_date = grp.index[0]
+            peak_val = roll_max.loc[peak_date]
+
+            after = nav.loc[trough_date:]
+            recovered = after[after >= peak_val]
+
+            if len(recovered) > 0:
+                recovery_date = recovered.index[0]
+                recovery_str = recovery_date.strftime('%d %b %Y')
+                recovery_days = (recovery_date - trough_date).days
+            else:
+                recovery_str = 'Not Recovered'
+                recovery_days = None
+
+            episodes.append({
+                'Peak Date': peak_date.strftime('%d %b %Y'),
+                'Trough Date': trough_date.strftime('%d %b %Y'),
+                'Max Drawdown': trough_val,
+                'Recovery Date': recovery_str,
+                'Days to Recover': recovery_days if recovery_days is not None else '—',
+            })
+
+        episodes.sort(key=lambda e: e['Max Drawdown'])  # most negative first
+        return episodes[:n]
+
     # ── Top-5 Drawdown Episodes Helper ────────────────────────────────
     def get_top_drawdowns(nav: pd.Series, n: int = 5) -> list:
         """
