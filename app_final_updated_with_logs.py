@@ -862,7 +862,7 @@ with tab_summary:
     preview_df = df.head(10).round(2)
     st.dataframe(
         preview_df.style.format("{:.2f}").set_properties(**{'text-align': 'center'}),
-        use_container_width=True,
+        width='stretch',
     )
     log.debug("TAB Summary: complete")
 
@@ -902,7 +902,7 @@ with tab_perf:
     }
     perf_df = pd.DataFrame(perf_data, index=portfolios).T
     log.debug("Performance tab: metrics table shape=%s", perf_df.shape)
-    st.dataframe(perf_df, use_container_width=True)
+    st.dataframe(perf_df, width='stretch')
 
     st.markdown("---")
 
@@ -979,7 +979,7 @@ with tab_perf:
             }
             period_df = pd.DataFrame(period_data, index=portfolios).T
             st.markdown(f"**Period: {perf_start.strftime('%d %b %Y')} → {perf_end.strftime('%d %b %Y')}**")
-            st.dataframe(period_df, use_container_width=True)
+            st.dataframe(period_df, width='stretch')
             log.debug("Performance tab custom period: table rendered, shape=%s", period_df.shape)
 
 
@@ -1025,7 +1025,7 @@ with tab_nav:
 
         apply_layout(fig, yaxis_title='NAV Value')
         fig.update_xaxes(tickformat='%b %Y')
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         log.info("NAV Curve tab: chart rendered")
 
 
@@ -1082,35 +1082,95 @@ with tab_dd:
     fig.update_xaxes(tickformat='%b %Y')
     # Thin dotted zero-line for reference (not the same as the series zero)
     fig.add_hline(y=0, line_dash='dot', line_color='rgba(255,255,255,0.1)', line_width=1)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     # ── Max Drawdown Summary Table ────────────────────────────────────
-    st.markdown("**Max Drawdown Summary**")
-    dd_rows = []
-    for p in portfolios:
-        nav = df[p].dropna()
+  
+    # ── Top-5 Drawdown Episodes Helper ────────────────────────────────
+    def get_top_drawdowns(nav: pd.Series, n: int = 5) -> list:
+        """
+        Identify peak-to-trough drawdown episodes (not just point-in-time
+        values) and return the n deepest ones, each with peak date,
+        trough date, magnitude, and recovery date.
+
+        An "episode" starts at a new all-time-high (drawdown == 0) and
+        runs until the next new all-time-high. The single worst point
+        within each episode is its trough.
+        """
+        nav = nav.dropna()
         nav = nav[nav > 0]
-        rolling_max = nav.cummax()
-        dd = ((nav - rolling_max) / rolling_max).clip(upper=0)
-        max_dd = dd.min()
-        max_dd_date = dd.idxmin()
 
-        # Recovery: first date after the max-drawdown trough where NAV
-        # returns to (or exceeds) the pre-trough rolling peak
-        peak_before = rolling_max.loc[max_dd_date]
-        after = nav.loc[max_dd_date:]
-        recovered = after[after >= peak_before]
-        recovery = recovered.index[0].strftime('%b %Y') if len(recovered) > 0 else 'Not recovered'
+        if len(nav) < 2:
+            return []
 
-        log.debug("Drawdown summary '%s': max_dd=%.2f%% recovery='%s'", p, max_dd * 100, recovery)
-        dd_rows.append({
-            'Portfolio': p,
-            'Max Drawdown': f"{max_dd*100:.2f}%",
-            'Date of Max DD': max_dd_date.strftime('%d %b %Y'),
-            'Recovery Date': recovery,
-        })
+        roll_max = nav.cummax()
+        dd = (nav - roll_max) / roll_max  # <= 0, 0 at new highs
 
-    st.dataframe(pd.DataFrame(dd_rows).set_index('Portfolio'), use_container_width=True)
+        # New group starts every time drawdown resets to 0 (new peak)
+        is_peak = dd == 0
+        group_id = is_peak.cumsum()
+
+        episodes = []
+        for _, grp in dd.groupby(group_id):
+            if not (grp < 0).any():
+                continue  # flat/only-peak group, no actual decline
+
+            trough_date = grp.idxmin()
+            trough_val = grp.min()
+            peak_date = grp.index[0]
+            peak_val = roll_max.loc[peak_date]
+
+            after = nav.loc[trough_date:]
+            recovered = after[after >= peak_val]
+
+            if len(recovered) > 0:
+                recovery_date = recovered.index[0]
+                recovery_str = recovery_date.strftime('%d %b %Y')
+                recovery_days = (recovery_date - trough_date).days
+            else:
+                recovery_str = 'Not Recovered'
+                recovery_days = None
+
+            episodes.append({
+                'Peak Date': peak_date.strftime('%d %b %Y'),
+                'Trough Date': trough_date.strftime('%d %b %Y'),
+                'Max Drawdown': trough_val,
+                'Recovery Date': recovery_str,
+                'Days to Recover': recovery_days if recovery_days is not None else '—',
+            })
+
+        episodes.sort(key=lambda e: e['Max Drawdown'])  # most negative first
+        return episodes[:n]
+
+    # ── Top-5 Drawdowns Table (per portfolio) ─────────────────────────
+    st.markdown("**Top 5 Drawdowns**")
+    st.markdown(
+        '<div class="section-sub">Deepest peak-to-trough declines per portfolio, with recovery date</div>',
+        unsafe_allow_html=True,
+    )
+
+    for i, p in enumerate(portfolios):
+        top5 = get_top_drawdowns(df[p], n=5)
+        color = PALETTE[i % len(PALETTE)]
+
+        log.info("Drawdown tab '%s': top-%d episodes computed", p, len(top5))
+
+        if not top5:
+            log.warning("Drawdown tab '%s': no drawdown episodes found", p)
+            continue
+
+        rows_df = pd.DataFrame(top5)
+        rows_df.index = range(1, len(rows_df) + 1)
+        rows_df.index.name = 'Rank'
+        rows_df['Max Drawdown'] = rows_df['Max Drawdown'].map(lambda v: f"{v*100:.2f}%")
+
+        st.markdown(
+            f'<div style="font-family:\'Syne\',sans-serif;font-weight:700;color:{color};'
+            f'margin-top:10px;margin-bottom:6px">{p}</div>',
+            unsafe_allow_html=True,
+        )
+        st.dataframe(rows_df, width='stretch')
+
     log.info("Drawdown tab: complete")
 
 
@@ -1143,7 +1203,7 @@ with tab_rstd:
 
     apply_layout(fig, yaxis_title='Ann. Std Dev (%)')
     fig.update_xaxes(tickformat='%b %Y')
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     log.info("Rolling Std tab: chart rendered")
 
 
@@ -1178,7 +1238,7 @@ with tab_rsharpe:
     fig.update_xaxes(tickformat='%b %Y')
     # Dotted zero-line: Sharpe > 0 means the portfolio beat the risk-free rate (0 %)
     fig.add_hline(y=0, line_dash='dot', line_color='rgba(255,255,255,0.1)', line_width=1)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     log.info("Rolling Sharpe tab: chart rendered")
 
 
@@ -1282,7 +1342,7 @@ with tab_rcagr:
     apply_layout(fig, yaxis_title='Rolling CAGR (%)')
     fig.update_xaxes(tickformat='%b %Y')
     fig.add_hline(y=0, line_dash='dot', line_color='rgba(255,255,255,0.1)', line_width=1)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     # ── Median Rolling CAGR Heatmap Table ────────────────────────────
     st.markdown("**Median Rolling CAGR by Window (12–60 months)**")
@@ -1338,7 +1398,7 @@ with tab_rcagr:
         .apply(color_column, axis=0)
         .format(lambda x: f"{x:+.2f}%" if not pd.isna(x) else "—")
     )
-    st.dataframe(styled_heat, use_container_width=True, height=420)
+    st.dataframe(styled_heat, width='stretch', height=420)
     log.info("Rolling CAGR tab: complete")
 
 
@@ -1401,7 +1461,7 @@ with tab_yearly:
     fig.update_layout(barmode='group', bargap=0.2)
     # Reference line at zero: positive bars above, negative bars below
     fig.add_hline(y=0, line_dash='dot', line_color='rgba(255,255,255,0.15)', line_width=1)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     # ── Yearly returns styled table ───────────────────────────────────
     table_data = {p: {yr: yearly[p].get(yr, np.nan) for yr in all_years} for p in portfolios}
@@ -1442,7 +1502,7 @@ with tab_yearly:
         .apply(color_row, axis=1)
         .format(lambda x: f"{x:+.2f}%" if not pd.isna(x) else "—")
     )
-    st.dataframe(styled_yearly, use_container_width=True)
+    st.dataframe(styled_yearly, width='stretch')
     log.info("Yearly Returns tab: complete")
 
 
@@ -1588,7 +1648,7 @@ with tab_dist:
             fig.update_xaxes(ticksuffix='%', tickformat='.1f', title_text='Monthly Return (%)')
 
             with cols_dist[col]:
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
                 log.debug("Distribution tab '%s': KDE chart rendered", p)
 
     log.info("Distribution tab: all charts rendered — session render complete")
