@@ -173,7 +173,68 @@ p, span, div, label, li, td, th {
     color: #C8D8EA !important;
     font-size: 14px !important;
 }
+/* Selectbox dropdown menu (options list) — BaseWeb renders this in a portal,
+   so it needs its own explicit targeting separate from the closed widget */
+[data-baseweb="popover"] [data-baseweb="menu"] {
+    background-color: #0A1220 !important;
+    border: 1px solid #243855 !important;
+}
+[data-baseweb="popover"] [data-baseweb="menu"] li {
+    background-color: #0A1220 !important;
+    color: #E8EFF8 !important;
+}
+[data-baseweb="popover"] [data-baseweb="menu"] li:hover {
+    background-color: #1A2B45 !important;
+    color: #FFFFFF !important;
+}
+/* Highlighted/selected option gets a subtle accent tint */
+[data-baseweb="popover"] [data-baseweb="menu"] li[aria-selected="true"] {
+    background-color: rgba(0,207,255,0.12) !important;
+    color: #00CFFF !important;
+}
 
+/* Closed selectbox widget itself — ensure selected value text is visible too */
+[data-testid="stSelectbox"] div[data-baseweb="select"] > div {
+    background-color: #0F1A2E !important;
+    color: #E8EFF8 !important;
+    border-color: #243855 !important;
+}
+            /* Dropdown popover container */
+div[data-baseweb="popover"] {
+    background-color: #0A1220 !important;
+}
+div[data-baseweb="popover"] > div {
+    background-color: #0A1220 !important;
+}
+
+/* The menu/listbox itself */
+ul[role="listbox"],
+div[data-baseweb="menu"] {
+    background-color: #0A1220 !important;
+    border: 1px solid #243855 !important;
+}
+
+/* Individual options */
+li[role="option"],
+ul[role="listbox"] li {
+    background-color: #0A1220 !important;
+    color: #E8EFF8 !important;
+}
+li[role="option"]:hover,
+ul[role="listbox"] li:hover {
+    background-color: #1A2B45 !important;
+    color: #FFFFFF !important;
+}
+li[role="option"][aria-selected="true"] {
+    background-color: rgba(0,207,255,0.12) !important;
+    color: #00CFFF !important;
+}
+
+/* Text inside each option (BaseWeb sometimes wraps label text in an inner span/div) */
+li[role="option"] * {
+    color: inherit !important;
+}
+            
 /* All widget labels globally */
 [data-testid="stWidgetLabel"] p,
 .stSelectbox label,
@@ -713,7 +774,7 @@ with info_col:
 # ─────────────────────────────────────────────
 
 @st.cache_data
-def load_data(file_bytes: bytes, filename: str) -> pd.DataFrame:
+def load_data(file_bytes: bytes, filename: str, sheet_name: str = 0) -> pd.DataFrame:
     """
     Read an uploaded CSV or Excel file into a cleaned DataFrame.
 
@@ -735,7 +796,7 @@ def load_data(file_bytes: bytes, filename: str) -> pd.DataFrame:
         df = pd.read_csv(io.BytesIO(file_bytes), parse_dates=[0], index_col=0)
         log.debug("load_data: CSV parsed, raw shape=%s", df.shape)
     else:
-        df = pd.read_excel(io.BytesIO(file_bytes), parse_dates=[0], index_col=0)
+        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, parse_dates=[0], index_col=0)
         log.debug("load_data: Excel parsed, raw shape=%s", df.shape)
 
     # Normalise the DatetimeIndex (handles mixed day/month ordering)
@@ -763,14 +824,42 @@ if uploaded is None:
     st.stop()
 
 # ── Read the uploaded bytes and parse the DataFrame ──────────────────
+# ── Read the uploaded bytes and parse the DataFrame ──────────────────
 file_bytes = uploaded.read()
 log.info("File received: name='%s' size=%d bytes", uploaded.name, len(file_bytes))
 
+# ── Sheet selection for multi-sheet Excel files ───────────────────────
+sheet_name = 0  # default: first sheet (also correct default for CSV, which ignores it)
+is_excel = uploaded.name.lower().endswith(('.xlsx', '.xls'))
+
+if is_excel:
+    try:
+        xl = pd.ExcelFile(io.BytesIO(file_bytes))
+        sheet_names = xl.sheet_names
+        log.info("Excel file detected: sheets=%s", sheet_names)
+    except Exception as e:
+        log.error("Failed to read sheet names for '%s': %s", uploaded.name, e, exc_info=True)
+        st.error(f"Error reading Excel file structure: {e}")
+        st.stop()
+
+    if len(sheet_names) > 1:
+        sheet_name = st.selectbox(
+            "Sheet containing NAV data",
+            options=sheet_names,
+            index=0,
+            key='sheet_select',
+            help="First column = Date | Remaining columns = Portfolio NAV series",
+        )
+        log.info("User selected sheet='%s' from %d available", sheet_name, len(sheet_names))
+    else:
+        sheet_name = sheet_names[0]
+        log.debug("Excel file has a single sheet '%s' — no selector shown", sheet_name)
+
 try:
-    df = load_data(file_bytes, uploaded.name)
+    df = load_data(file_bytes, uploaded.name, sheet_name)
 except Exception as e:
     # Unrecoverable parse error — surface to user and halt execution
-    log.error("load_data failed for '%s': %s", uploaded.name, e, exc_info=True)
+    log.error("load_data failed for '%s' sheet='%s': %s", uploaded.name, sheet_name, e, exc_info=True)
     st.error(f"Error reading file: {e}")
     st.stop()
 
@@ -1331,12 +1420,12 @@ with tab_rcagr:
     st.markdown('<div class="section-title">Rolling CAGR</div>', unsafe_allow_html=True)
 
     @st.cache_data
-    def find_optimal_cagr_window(file_bytes: bytes, filename: str) -> int:
+    def find_optimal_cagr_window(file_bytes: bytes, filename: str, sheet_name=0) -> int:
         """
         Search windows 12–60 months and return the one that maximises the
         average median rolling CAGR across all portfolios.
 
-        Cached on (file_bytes, filename) so it only runs once per uploaded
+        Cached on (file_bytes, filename, sheet_name) so it only runs once per uploaded
         file, even as the user adjusts the slider below.
 
         Algorithm
@@ -1352,7 +1441,7 @@ with tab_rcagr:
         Return the window w with the highest score.
         """
         log.info("find_optimal_cagr_window: starting search 12–60 months for file='%s'", filename)
-        df_c = load_data(file_bytes, filename)
+        df_c = load_data(file_bytes, filename,sheet_name)
         af = 252 if detect_frequency(df_c.index) == 'daily' else 12
         portfolios_c = df_c.columns.tolist()
 
@@ -1389,13 +1478,15 @@ with tab_rcagr:
 
     optimal_window = find_optimal_cagr_window(file_bytes, uploaded.name)
     log.info("Rolling CAGR tab: optimal window=%d months", optimal_window)
-
     st.markdown(f"""
-    <div class="info-box">
-    🔍 <b>Optimal window detected:</b> <b style="color:#00CFFF">{optimal_window} months</b> — 
-    this window produces the highest median rolling CAGR across all portfolios (tested 12–60 months).
-    </div>
-    """, unsafe_allow_html=True)
+        <div class="info-box">
+        ℹ️ <b>Default window:</b> <b style="color:#00CFFF">{optimal_window} months</b> — 
+        the lookback that happened to produce the highest median rolling CAGR for this dataset 
+        (searched 12–60 months). This is not a forecast or a statistically "correct" window — 
+        it reflects which period looked best in hindsight. Adjust the slider below to explore others.
+        </div>
+        """, unsafe_allow_html=True)
+
 
     cagr_window = st.slider(
         "Rolling Window (months)",
