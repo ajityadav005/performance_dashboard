@@ -1476,7 +1476,7 @@ with tab_rcagr:
         log.info("find_optimal_cagr_window: optimal=%d months (score=%.2f%%)", best_window, best_score)
         return best_window
 
-    optimal_window = find_optimal_cagr_window(file_bytes, uploaded.name)
+    optimal_window = find_optimal_cagr_window(file_bytes, uploaded.name, sheet_name)
     log.info("Rolling CAGR tab: optimal window=%d months", optimal_window)
     st.markdown(f"""
         <div class="info-box">
